@@ -247,12 +247,14 @@ def validate_vncorenlp_files() -> None:
 
 def initialize_vncorenlp() -> None:
     """
-    Lazy initialize VnCoreNLP.
+    Initialize VnCoreNLP once during FastAPI startup.
 
-    Important:
-    - Do not set CLASSPATH manually here.
-    - py_vncorenlp.VnCoreNLP(save_dir=...) handles its own jar path.
-    - This mirrors the standalone test that works for you.
+    This is intentionally NOT lazy-loaded. pyjnius/JVM should be started once
+    before request handling begins; starting it inside concurrent requests can
+    cause: "VM is already running, can't set classpath/options".
+
+    If initialization fails, the API keeps running and only the vncorenlp
+    segmenter returns HTTP 503. underthesea and pyvi still work.
     """
     try:
         validate_vncorenlp_files()
@@ -262,7 +264,7 @@ def initialize_vncorenlp() -> None:
         save_dir = str(VNCORENLP_DIR.resolve())
 
         print("=" * 100)
-        print("Initializing VnCoreNLP")
+        print("Initializing VnCoreNLP at startup")
         print(f"ROOT_DIR: {ROOT_DIR}")
         print(f"VNCORENLP_DIR: {VNCORENLP_DIR}")
         print(f"save_dir: {save_dir}")
@@ -290,13 +292,8 @@ def get_vncorenlp_segmenter():
     if state.vncorenlp_segmenter is not None:
         return state.vncorenlp_segmenter
 
-    initialize_vncorenlp()
-
-    if state.vncorenlp_segmenter is None:
-        detail = state.vncorenlp_error or "Unknown VnCoreNLP initialization error."
-        raise RuntimeError(f"VnCoreNLP segmenter is not initialized. Detail: {detail}")
-
-    return state.vncorenlp_segmenter
+    detail = state.vncorenlp_error or "VnCoreNLP was not initialized during startup."
+    raise RuntimeError(f"VnCoreNLP segmenter is not initialized. Detail: {detail}")
 
 
 def word_segment_text(text: str, segmenter: Optional[str] = None) -> str:
@@ -760,6 +757,11 @@ def startup_event() -> None:
         state.ner_model.to(DEVICE)
         state.ner_model.eval()
         state.id2label = state.ner_model.config.id2label
+
+        # Initialize VnCoreNLP once at startup to avoid pyjnius/JVM race conditions
+        # during concurrent requests. If this fails, only the vncorenlp segmenter
+        # is unavailable; underthesea and pyvi still work.
+        initialize_vncorenlp()
 
         print("Application startup complete.")
 
