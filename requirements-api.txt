@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+numpy
+torch
+transformers
+sentence-transformers
+faiss-cpu
+rank-bm25
+underthesea
+pyvi
+py_vncorenlp
+pyjnius
+safetensors
+gdown

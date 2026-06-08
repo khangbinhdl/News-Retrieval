@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# IDE / editors
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs
+*.log
+logs/
+
+# Model and runtime artifacts
+models/
+retrieval_artifacts/
+
+# Old artifact/model folder names, if still present
+PhoBERT/
+Vietnamese_Embedding/
+VnCoreNLP/
+news_faiss_demo/
+
+# Large ML files
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# FAISS / BM25 / metadata artifacts
+*.index
+*.faiss
+*.pkl
+metadata.jsonl
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Optional: keep notebooks, but ignore notebook checkpoints only
+# notebooks/*.ipynb
