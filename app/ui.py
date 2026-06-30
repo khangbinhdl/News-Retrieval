@@ -251,6 +251,7 @@ def build_search_payload(
 
 def build_entity_search_payload(
     entity_text: str,
+    entity_type: str,
     original_text: str,
     method: str,
     top_k: int,
@@ -258,6 +259,7 @@ def build_entity_search_payload(
 ) -> Dict[str, Any]:
     return {
         "entity_text": entity_text,
+        "entity_type": entity_type,
         "original_text": original_text,
         "method": method,
         "top_k": top_k,
@@ -299,12 +301,20 @@ def run_direct_search(
 
 def run_entity_search(
     entity_text: str,
+    entity_type: str,
     original_text: str,
     method: str,
     top_k: int,
     alpha: float,
 ) -> None:
-    payload = build_entity_search_payload(entity_text, original_text, method, top_k, alpha)
+    payload = build_entity_search_payload(
+        entity_text,
+        entity_type,
+        original_text,
+        method,
+        top_k,
+        alpha,
+    )
     result = post_json("/entity-search", payload)
 
     st.session_state.search_result = result
@@ -403,8 +413,6 @@ with st.sidebar:
     else:
         alpha = 0.6
 
-    st.caption("Đổi method/top_k/alpha chỉ rerender UI, không gọi lại NER hoặc search.")
-
 
 default_query = "Bệnh nhân 129 ở Hà Nội từng nhập cảnh qua sân bay Nội Bài."
 
@@ -491,6 +499,7 @@ with left_col:
                 try:
                     run_entity_search(
                         entity_text=selected_entity["text"],
+                        entity_type=selected_entity.get("type", ""),
                         original_text=user_text,
                         method=method,
                         top_k=top_k,

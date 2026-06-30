@@ -90,6 +90,14 @@ VNCORENLP_DIR = resolve_project_path(
 DEFAULT_SEGMENTER = os.getenv("DEFAULT_SEGMENTER", "underthesea").lower().strip()
 SUPPORTED_SEGMENTERS = {"underthesea", "pyvi", "vncorenlp"}
 
+RRF_K = float(os.getenv("RRF_K", "60"))
+ENTITY_RERANK_MIN_CANDIDATES = int(os.getenv("ENTITY_RERANK_MIN_CANDIDATES", "50"))
+ENTITY_RERANK_MAX_CANDIDATES = int(os.getenv("ENTITY_RERANK_MAX_CANDIDATES", "200"))
+ENTITY_EXACT_TEXT_BONUS = float(os.getenv("ENTITY_EXACT_TEXT_BONUS", "0.35"))
+ENTITY_PARTIAL_TEXT_BONUS = float(os.getenv("ENTITY_PARTIAL_TEXT_BONUS", "0.15"))
+ENTITY_TYPE_BONUS = float(os.getenv("ENTITY_TYPE_BONUS", "0.10"))
+ENTITY_TYPE_ONLY_BONUS = float(os.getenv("ENTITY_TYPE_ONLY_BONUS", "0.03"))
+
 
 def resolve_device() -> str:
     requested_device = os.getenv("DEVICE", "cpu").lower().strip()
@@ -136,6 +144,7 @@ class AppState:
     id2label = None
     vncorenlp_segmenter = None
     vncorenlp_error: Optional[str] = None
+    artifact_validation: Dict[str, Any] = {}
 
 
 state = AppState()
@@ -145,7 +154,7 @@ segmenter_lock = threading.Lock()
 
 app = FastAPI(
     title="Vietnamese News Entity Retrieval API",
-    version="1.2.0",
+    version="1.3.0",
     description="PhoBERT NER + Vietnamese Embedding + FAISS + BM25 + selectable word segmentation.",
 )
 
@@ -174,6 +183,7 @@ class SearchRequest(BaseModel):
 
 class EntitySearchRequest(BaseModel):
     entity_text: str = Field(..., min_length=1)
+    entity_type: Optional[str] = None
     original_text: Optional[str] = None
     method: str = Field(default="hybrid")
     top_k: int = Field(default=5, ge=1, le=50)
@@ -183,6 +193,33 @@ class EntitySearchRequest(BaseModel):
 
 def normalize_text(text: str) -> str:
     return unicodedata.normalize("NFC", text.strip())
+
+
+def normalize_for_match(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+
+    normalized = normalize_text(str(value)).replace("_", " ").casefold()
+    return " ".join(normalized.split())
+
+
+def normalize_entity_type(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+
+    normalized = normalize_text(str(value)).casefold()
+    normalized = normalized.replace("&", "and")
+    normalized = normalized.replace("-", "_").replace(" ", "_")
+
+    aliases = {
+        "person_name": "name",
+        "occupation": "job",
+        "symptomanddisease": "symptom_and_disease",
+        "symptom_and_disease": "symptom_and_disease",
+        "symptom_disease": "symptom_and_disease",
+    }
+
+    return aliases.get(normalized, normalized)
 
 
 def normalize_segmenter(segmenter: Optional[str]) -> str:
@@ -337,6 +374,153 @@ def load_jsonl(path: Path) -> List[Dict[str, Any]]:
 def ensure_file_exists(path: Path, name: str) -> None:
     if not path.exists():
         raise FileNotFoundError(f"{name} not found: {path}")
+
+
+def bm25_corpus_size(bm25: Any) -> Optional[int]:
+    corpus_size = getattr(bm25, "corpus_size", None)
+
+    if corpus_size is not None:
+        return int(corpus_size)
+
+    doc_freqs = getattr(bm25, "doc_freqs", None)
+
+    if doc_freqs is not None:
+        return len(doc_freqs)
+
+    return None
+
+
+def validate_retrieval_artifacts() -> None:
+    errors = []
+    warnings = []
+
+    if state.index is None:
+        errors.append("FAISS index is not loaded.")
+
+    if state.bm25 is None:
+        errors.append("BM25 object is not loaded.")
+
+    if not state.metadata:
+        errors.append("metadata.jsonl is empty.")
+
+    metadata_count = len(state.metadata)
+    index_count = int(state.index.ntotal) if state.index is not None else None
+    index_dimension = int(state.index.d) if state.index is not None and hasattr(state.index, "d") else None
+    bm25_count = bm25_corpus_size(state.bm25) if state.bm25 is not None else None
+
+    if index_count is not None and index_count != metadata_count:
+        errors.append(
+            f"FAISS index size ({index_count}) does not match metadata rows ({metadata_count})."
+        )
+
+    if bm25_count is not None and bm25_count != metadata_count:
+        errors.append(
+            f"BM25 corpus size ({bm25_count}) does not match metadata rows ({metadata_count})."
+        )
+
+    if state.config:
+        expected_docs = state.config.get("num_docs")
+        expected_dimension = state.config.get("dimension")
+
+        if expected_docs is not None:
+            try:
+                expected_docs_int = int(expected_docs)
+            except (TypeError, ValueError):
+                errors.append(f"config.num_docs is not an integer: {expected_docs!r}.")
+            else:
+                if expected_docs_int != metadata_count:
+                    errors.append(
+                        f"config.num_docs ({expected_docs}) does not match metadata rows ({metadata_count})."
+                    )
+
+        if expected_dimension is not None and index_dimension is not None:
+            try:
+                expected_dimension_int = int(expected_dimension)
+            except (TypeError, ValueError):
+                errors.append(f"config.dimension is not an integer: {expected_dimension!r}.")
+            else:
+                if expected_dimension_int != index_dimension:
+                    errors.append(
+                        f"config.dimension ({expected_dimension}) does not match FAISS dimension ({index_dimension})."
+                    )
+    else:
+        warnings.append("config.json is empty.")
+
+    required_fields = {
+        "id": str,
+        "display_text": str,
+        "segmented_text": str,
+        "entities": list,
+    }
+    doc_ids = []
+
+    for row_idx, doc in enumerate(state.metadata):
+        if not isinstance(doc, dict):
+            errors.append(f"metadata row {row_idx} is not a JSON object.")
+            continue
+
+        for field_name, expected_type in required_fields.items():
+            if field_name not in doc:
+                errors.append(f"metadata row {row_idx} is missing required field '{field_name}'.")
+                continue
+
+            if not isinstance(doc[field_name], expected_type):
+                errors.append(
+                    f"metadata row {row_idx} field '{field_name}' has type "
+                    f"{type(doc[field_name]).__name__}, expected {expected_type.__name__}."
+                )
+
+        doc_id = doc.get("id")
+
+        if isinstance(doc_id, str):
+            doc_ids.append(doc_id)
+
+        if len(errors) >= 20:
+            break
+
+    duplicate_count = len(doc_ids) - len(set(doc_ids))
+
+    if duplicate_count > 0:
+        errors.append(f"metadata contains {duplicate_count} duplicate doc id(s).")
+
+    state.artifact_validation = {
+        "metadata_rows": metadata_count,
+        "faiss_ntotal": index_count,
+        "faiss_dimension": index_dimension,
+        "bm25_corpus_size": bm25_count,
+        "config_num_docs": state.config.get("num_docs") if state.config else None,
+        "config_dimension": state.config.get("dimension") if state.config else None,
+        "warnings": warnings,
+        "valid": len(errors) == 0,
+    }
+
+    if errors:
+        state.artifact_validation["errors"] = errors
+        raise ValueError("Invalid retrieval artifacts:\n- " + "\n- ".join(errors))
+
+
+def validate_embedding_model() -> None:
+    if state.embedder is None or state.index is None:
+        return
+
+    embedding_dimension = state.embedder.get_sentence_embedding_dimension()
+
+    if embedding_dimension is None:
+        state.artifact_validation["embedding_dimension"] = None
+        state.artifact_validation.setdefault("warnings", []).append(
+            "Embedding model did not report a sentence embedding dimension."
+        )
+        return
+
+    embedding_dimension = int(embedding_dimension)
+    index_dimension = int(state.index.d)
+    state.artifact_validation["embedding_dimension"] = embedding_dimension
+
+    if embedding_dimension != index_dimension:
+        state.artifact_validation["valid"] = False
+        raise ValueError(
+            f"Embedding dimension ({embedding_dimension}) does not match FAISS dimension ({index_dimension})."
+        )
 
 
 def extract_entities_from_bio(words: List[str], tags: List[str]) -> List[Dict[str, Any]]:
@@ -504,19 +688,26 @@ def predict_ner_entities(text: str, max_length: int = 256, segmenter: Optional[s
     }
 
 
-def min_max_normalize(scores: np.ndarray) -> np.ndarray:
-    scores = np.asarray(scores, dtype=np.float32)
+def normalize_result_scores(scores: List[float]) -> np.ndarray:
+    scores_array = np.asarray(scores, dtype=np.float32)
 
-    if len(scores) == 0:
-        return scores
+    if len(scores_array) == 0:
+        return scores_array
 
-    min_score = scores.min()
-    max_score = scores.max()
+    min_score = scores_array.min()
+    max_score = scores_array.max()
 
     if max_score - min_score < 1e-8:
-        return np.ones_like(scores)
+        return np.zeros_like(scores_array)
 
-    return (scores - min_score) / (max_score - min_score)
+    return (scores_array - min_score) / (max_score - min_score)
+
+
+def reciprocal_rank(rank: Optional[int]) -> float:
+    if rank is None:
+        return 0.0
+
+    return 1.0 / (RRF_K + float(rank))
 
 
 def format_result(
@@ -525,10 +716,14 @@ def format_result(
     method: str,
     vector_score: Optional[float] = None,
     bm25_score: Optional[float] = None,
+    vector_rank: Optional[int] = None,
+    bm25_rank: Optional[int] = None,
+    score_details: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     doc = state.metadata[int(doc_idx)]
 
     result = {
+        "doc_index": int(doc_idx),
         "doc_id": doc["id"],
         "score": float(score),
         "method": method,
@@ -536,6 +731,7 @@ def format_result(
         "segmented_text": doc["segmented_text"],
         "entities": doc.get("entities", []),
         "entity_texts": doc.get("entity_texts", []),
+        "entity_segmented_texts": doc.get("entity_segmented_texts", []),
         "entity_types": doc.get("entity_types", []),
     }
 
@@ -544,6 +740,15 @@ def format_result(
 
     if bm25_score is not None:
         result["bm25_score"] = float(bm25_score)
+
+    if vector_rank is not None:
+        result["vector_rank"] = int(vector_rank)
+
+    if bm25_rank is not None:
+        result["bm25_rank"] = int(bm25_rank)
+
+    if score_details is not None:
+        result["score_details"] = score_details
 
     return result
 
@@ -628,43 +833,67 @@ def hybrid_search(
 
     candidate_indices = list(candidate_indices)
 
-    vector_score_map = {
-        int(idx): float(score)
-        for score, idx in zip(vector_scores[0], vector_indices[0])
-        if idx >= 0
+    vector_score_map = {}
+    vector_rank_map = {}
+
+    for rank, (score, idx) in enumerate(zip(vector_scores[0], vector_indices[0]), start=1):
+        if idx < 0:
+            continue
+
+        doc_idx = int(idx)
+        vector_score_map[doc_idx] = float(score)
+        vector_rank_map[doc_idx] = rank
+
+    bm25_rank_map = {
+        int(idx): rank
+        for rank, idx in enumerate(bm25_top_indices, start=1)
     }
 
-    vector_scores_raw = np.array(
-        [vector_score_map.get(idx, 0.0) for idx in candidate_indices],
-        dtype=np.float32,
-    )
+    ranked_items = []
 
-    bm25_scores_raw = np.array(
-        [bm25_scores_all[idx] for idx in candidate_indices],
-        dtype=np.float32,
-    )
+    for idx in candidate_indices:
+        vector_rank = vector_rank_map.get(idx)
+        bm25_rank = bm25_rank_map.get(idx)
+        vector_rrf = reciprocal_rank(vector_rank)
+        bm25_rrf = reciprocal_rank(bm25_rank)
+        final_score = alpha * vector_rrf + (1.0 - alpha) * bm25_rrf
 
-    vector_scores_norm = min_max_normalize(vector_scores_raw)
-    bm25_scores_norm = min_max_normalize(bm25_scores_raw)
-
-    final_scores = alpha * vector_scores_norm + (1.0 - alpha) * bm25_scores_norm
+        ranked_items.append({
+            "doc_idx": idx,
+            "final_score": final_score,
+            "vector_score": vector_score_map.get(idx, 0.0),
+            "bm25_score": float(bm25_scores_all[idx]),
+            "vector_rank": vector_rank,
+            "bm25_rank": bm25_rank,
+            "vector_rrf": vector_rrf,
+            "bm25_rrf": bm25_rrf,
+        })
 
     ranked = sorted(
-        zip(candidate_indices, final_scores, vector_scores_raw, bm25_scores_raw),
-        key=lambda item: item[1],
+        ranked_items,
+        key=lambda item: (item["final_score"], item["vector_score"], item["bm25_score"]),
         reverse=True,
     )[:top_k]
 
     results = []
 
-    for idx, final_score, vector_score, bm25_score in ranked:
+    for item in ranked:
         results.append(
             format_result(
-                doc_idx=int(idx),
-                score=float(final_score),
+                doc_idx=int(item["doc_idx"]),
+                score=float(item["final_score"]),
                 method="hybrid",
-                vector_score=float(vector_score),
-                bm25_score=float(bm25_score),
+                vector_score=float(item["vector_score"]),
+                bm25_score=float(item["bm25_score"]),
+                vector_rank=item["vector_rank"],
+                bm25_rank=item["bm25_rank"],
+                score_details={
+                    "type": "weighted_rrf",
+                    "alpha": float(alpha),
+                    "rrf_k": float(RRF_K),
+                    "vector_rrf": float(item["vector_rrf"]),
+                    "bm25_rrf": float(item["bm25_rrf"]),
+                },
             )
         )
 
@@ -681,12 +910,174 @@ def build_entity_query(entity_text: str, original_text: Optional[str] = None) ->
     return entity_text
 
 
+def collect_doc_entity_values(doc: Dict[str, Any], field_name: str) -> List[str]:
+    values = [
+        str(value)
+        for value in doc.get(field_name, []) or []
+        if value is not None
+    ]
+
+    entity_field_map = {
+        "entity_texts": "text",
+        "entity_segmented_texts": "segmented_text",
+        "entity_types": "type",
+    }
+    nested_field_name = entity_field_map.get(field_name)
+
+    if nested_field_name:
+        for entity in doc.get("entities", []) or []:
+            value = entity.get(nested_field_name)
+
+            if value is not None:
+                values.append(str(value))
+
+    return values
+
+
+def entity_match_features(
+    doc: Dict[str, Any],
+    entity_text: str,
+    entity_type: Optional[str] = None,
+) -> Dict[str, Any]:
+    entity_norm = normalize_for_match(entity_text)
+    entity_type_norm = normalize_entity_type(entity_type)
+
+    entity_text_values = collect_doc_entity_values(doc, "entity_texts")
+    entity_segmented_values = collect_doc_entity_values(doc, "entity_segmented_texts")
+    entity_type_values = collect_doc_entity_values(doc, "entity_types")
+
+    normalized_entity_texts = {
+        normalize_for_match(value)
+        for value in entity_text_values + entity_segmented_values
+        if normalize_for_match(value)
+    }
+    normalized_entity_types = {
+        normalize_entity_type(value)
+        for value in entity_type_values
+        if normalize_entity_type(value)
+    }
+
+    display_text_norm = normalize_for_match(doc.get("display_text", ""))
+    segmented_text_norm = normalize_for_match(doc.get("segmented_text", ""))
+
+    exact_text_match = bool(entity_norm and entity_norm in normalized_entity_texts)
+    partial_text_match = bool(
+        entity_norm
+        and not exact_text_match
+        and (
+            entity_norm in display_text_norm
+            or entity_norm in segmented_text_norm
+            or any(entity_norm in value for value in normalized_entity_texts)
+            or any(value in entity_norm for value in normalized_entity_texts if value)
+        )
+    )
+    type_match = bool(entity_type_norm and entity_type_norm in normalized_entity_types)
+
+    text_bonus = 0.0
+
+    if exact_text_match:
+        text_bonus = ENTITY_EXACT_TEXT_BONUS
+    elif partial_text_match:
+        text_bonus = ENTITY_PARTIAL_TEXT_BONUS
+
+    if type_match and (exact_text_match or partial_text_match):
+        type_bonus = ENTITY_TYPE_BONUS
+    elif type_match:
+        type_bonus = ENTITY_TYPE_ONLY_BONUS
+    else:
+        type_bonus = 0.0
+
+    return {
+        "exact_text_match": exact_text_match,
+        "partial_text_match": partial_text_match,
+        "type_match": type_match,
+        "text_bonus": float(text_bonus),
+        "type_bonus": float(type_bonus),
+        "bonus": float(text_bonus + type_bonus),
+        "entity_type": entity_type,
+    }
+
+
+def infer_entity_type(
+    entity_text: str,
+    original_text: Optional[str],
+    segmenter: Optional[str],
+) -> Optional[str]:
+    if not original_text:
+        return None
+
+    entity_norm = normalize_for_match(entity_text)
+
+    if not entity_norm:
+        return None
+
+    prediction = predict_ner_entities(original_text, segmenter=segmenter)
+
+    for entity in prediction.get("entities", []):
+        candidate_values = [
+            entity.get("text"),
+            entity.get("segmented_text"),
+        ]
+
+        if any(normalize_for_match(value) == entity_norm for value in candidate_values):
+            return entity.get("type")
+
+    return None
+
+
+def rerank_results_by_entity(
+    results: List[Dict[str, Any]],
+    entity_text: str,
+    entity_type: Optional[str],
+    top_k: int,
+) -> List[Dict[str, Any]]:
+    if not results:
+        return []
+
+    base_scores = [float(result.get("score", 0.0)) for result in results]
+    normalized_base_scores = normalize_result_scores(base_scores)
+    reranked = []
+
+    for result, base_score_norm in zip(results, normalized_base_scores):
+        doc_idx = result.get("doc_index")
+
+        if doc_idx is None:
+            continue
+
+        doc = state.metadata[int(doc_idx)]
+        match_features = entity_match_features(doc, entity_text, entity_type)
+        retrieval_score = float(result.get("score", 0.0))
+        entity_bonus = float(match_features["bonus"])
+        final_score = float(base_score_norm) + entity_bonus
+        updated_result = dict(result)
+
+        updated_result["retrieval_score"] = retrieval_score
+        updated_result["base_score_norm"] = float(base_score_norm)
+        updated_result["entity_bonus"] = entity_bonus
+        updated_result["entity_match"] = match_features
+        updated_result["rerank_method"] = "entity_boost"
+        updated_result["score"] = final_score
+
+        reranked.append(updated_result)
+
+    return sorted(
+        reranked,
+        key=lambda item: (
+            item["score"],
+            item.get("entity_bonus", 0.0),
+            item.get("retrieval_score", 0.0),
+        ),
+        reverse=True,
+    )[:top_k]
+
+
 def search_documents(
     query: str,
     method: str = "hybrid",
     top_k: int = 5,
     alpha: float = 0.6,
     segmenter: Optional[str] = None,
+    candidate_k: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     method = method.lower().strip()
 
@@ -700,7 +1091,7 @@ def search_documents(
         return hybrid_search(
             query=query,
             top_k=top_k,
-            candidate_k=max(50, top_k * 10),
+            candidate_k=candidate_k if candidate_k is not None else max(50, top_k * 10),
             alpha=alpha,
             segmenter=segmenter,
         )
@@ -729,14 +1120,12 @@ def startup_event() -> None:
         ensure_file_exists(INDEX_PATH, "FAISS index")
         ensure_file_exists(METADATA_PATH, "metadata.jsonl")
         ensure_file_exists(BM25_PATH, "bm25.pkl")
+        ensure_file_exists(CONFIG_PATH, "config.json")
         ensure_file_exists(NER_MODEL_DIR, "PhoBERT model directory")
         ensure_file_exists(EMBEDDING_MODEL_DIR, "Vietnamese embedding model directory")
 
-        if CONFIG_PATH.exists():
-            with CONFIG_PATH.open("r", encoding="utf-8") as f:
-                state.config = json.load(f)
-        else:
-            state.config = {}
+        with CONFIG_PATH.open("r", encoding="utf-8") as f:
+            state.config = json.load(f)
 
         print(f"Loading FAISS index: {INDEX_PATH}")
         state.index = faiss.read_index(str(INDEX_PATH))
@@ -748,8 +1137,11 @@ def startup_event() -> None:
         with BM25_PATH.open("rb") as f:
             state.bm25 = pickle.load(f)
 
+        validate_retrieval_artifacts()
+
         print(f"Loading embedding model: {EMBEDDING_MODEL_DIR}")
         state.embedder = SentenceTransformer(str(EMBEDDING_MODEL_DIR), device=DEVICE)
+        validate_embedding_model()
 
         print(f"Loading PhoBERT tokenizer/model: {NER_MODEL_DIR}")
         state.ner_tokenizer = AutoTokenizer.from_pretrained(str(NER_MODEL_DIR), use_fast=False)
@@ -805,6 +1197,7 @@ def health() -> Dict[str, Any]:
         "vncorenlp_error": state.vncorenlp_error,
         "vncorenlp_files": vncorenlp_file_status(),
         "default_segmenter": DEFAULT_SEGMENTER,
+        "artifact_validation": state.artifact_validation,
     }
 
 
@@ -912,24 +1305,48 @@ def entity_search(payload: EntitySearchRequest) -> Dict[str, Any]:
     try:
         selected_segmenter = normalize_segmenter(payload.segmenter)
         final_query = build_entity_query(payload.entity_text, payload.original_text)
+        entity_type = normalize_text(payload.entity_type) if payload.entity_type else None
 
-        results = search_documents(
+        if entity_type is None:
+            entity_type = infer_entity_type(
+                entity_text=payload.entity_text,
+                original_text=payload.original_text,
+                segmenter=selected_segmenter,
+            )
+
+        candidate_top_k = min(
+            len(state.metadata),
+            ENTITY_RERANK_MAX_CANDIDATES,
+            max(payload.top_k * 10, ENTITY_RERANK_MIN_CANDIDATES),
+        )
+
+        candidate_results = search_documents(
             query=final_query,
             method=payload.method,
-            top_k=payload.top_k,
+            top_k=candidate_top_k,
             alpha=payload.alpha,
             segmenter=selected_segmenter,
+            candidate_k=candidate_top_k,
+        )
+        results = rerank_results_by_entity(
+            results=candidate_results,
+            entity_text=payload.entity_text,
+            entity_type=entity_type,
+            top_k=payload.top_k,
         )
 
         return {
             "entity_text": payload.entity_text,
+            "entity_type": entity_type,
             "original_text": payload.original_text,
             "final_query": final_query,
             "segmenter": selected_segmenter,
             "segmented_query": word_segment_text(final_query, selected_segmenter),
             "method": payload.method,
             "top_k": payload.top_k,
+            "candidate_top_k": candidate_top_k,
             "alpha": payload.alpha,
+            "rerank_method": "entity_boost",
             "results": results,
         }
 
